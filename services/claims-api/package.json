@@ -1,0 +1,19 @@
+{
+  "name": "claims-api",
+  "version": "0.1.0",
+  "description": "Claims API service with Playwright API tests",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "playwright test"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
