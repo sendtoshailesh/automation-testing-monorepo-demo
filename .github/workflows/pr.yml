@@ -1,0 +1,188 @@
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  # ── 1. Detect which services changed ──────────────────────────────────────
+  changed-services:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+      has_services: ${{ steps.detect.outputs.has_services }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Detect changed services
+        id: detect
+        run: |
+          python tools/ci/changed_services.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"
+
+  # ── 2. PII scan ────────────────────────────────────────────────────────────
+  pii-scan:
+    runs-on: ubuntu-latest
+    needs: changed-services
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: Run PII / secrets scan
+        run: python tools/ci/pii_scan.py --path .
+
+  # ── 3a. Python service tests (pricing / policy) ───────────────────────────
+  python-service-tests:
+    runs-on: ubuntu-latest
+    needs: changed-services
+    if: needs.changed-services.outputs.has_services == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.changed-services.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Run unit tests
+        working-directory: services/${{ matrix.service }}
+        run: pytest tests/unit -v --tb=short --junitxml=test-results/unit.xml
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-results-${{ matrix.service }}
+          path: services/${{ matrix.service }}/test-results/
+
+  # ── 3b. claims-api Playwright API tests ───────────────────────────────────
+  claims-api-tests:
+    runs-on: ubuntu-latest
+    needs: changed-services
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: services/claims-api/package-lock.json
+
+      - name: Install dependencies
+        working-directory: services/claims-api
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: services/claims-api
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright API tests
+        working-directory: services/claims-api
+        run: npm test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-claims-api
+          path: services/claims-api/playwright-report/
+
+  # ── 3c. ui-portal Selenium tests (self-hosted) ────────────────────────────
+  ui-portal-tests:
+    runs-on: self-hosted
+    needs: changed-services
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        working-directory: services/ui-portal
+        run: uv pip install -e ".[dev]" --system
+
+      - name: Run Selenium tests
+        working-directory: services/ui-portal
+        run: pytest tests/ -v --tb=short --junitxml=test-results/selenium.xml
+
+      - name: Upload Selenium test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-results-ui-portal
+          path: services/ui-portal/test-results/
+
+  # ── 4. Generate & commit PR evidence ──────────────────────────────────────
+  pr-evidence:
+    runs-on: ubuntu-latest
+    needs:
+      - pii-scan
+      - python-service-tests
+      - claims-api-tests
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref }}
+
+      - name: Download all test artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/test-artifacts
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate PR evidence
+        run: |
+          python tools/ci/generate_pr_evidence.py \
+            --template evidence/templates/pr-evidence.md \
+            --artifacts /tmp/test-artifacts \
+            --pr "${{ github.event.pull_request.number }}" \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --output "evidence/pr/pr-${{ github.event.pull_request.number }}.md"
+
+      - name: Commit evidence back to PR branch
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add evidence/pr/
+          git diff --cached --quiet || git commit -m "ci: add PR evidence for PR #${{ github.event.pull_request.number }} [skip ci]"
+          git push
